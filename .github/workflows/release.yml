@@ -54,7 +54,7 @@ jobs:
 
       - uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAURI_BUNDLER_DMG_IGNORE_CI: "1"
@@ -164,7 +164,7 @@ jobs:
             --arg win_url "${OSS_BASE}/VibeCraft-${VERSION}-win-x64.exe" \
             '{
               "darwin-aarch64": {"url": $arm_url, "signature": $arm_sig},
-              "darwin-x86_64":  {"url": $x64_url, "signature": $x64_sig},
+              "darwin-x86_64":  {"url": $x64_url, "signature": $sig_x64},
               "windows-x86_64": {"url": $win_url, "signature": ""}
             }')
 
