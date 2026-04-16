@@ -52,8 +52,8 @@ jobs:
           cp apps/admin/nginx.conf /tmp/deploy-bundle/apps/admin/
           mkdir -p /tmp/deploy-bundle/ops/nginx
           cp ops/nginx/vibecraft.conf /tmp/deploy-bundle/ops/nginx/
-          tar -czf /tmp/vibecraft-deploy.tar.gz -C /tmp/deploy-bundle .
-          ls -lh /tmp/vibecraft-deploy.tar.gz
+          tar -czf vibecraft-deploy.tar.gz -C /tmp/deploy-bundle .
+          ls -lh vibecraft-deploy.tar.gz
 
       - name: Copy deploy bundle to Tencent Cloud
         uses: appleboy/scp-action@v0.1.7
@@ -61,7 +61,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "/tmp/vibecraft-deploy.tar.gz"
+          source: "vibecraft-deploy.tar.gz"
           target: "/tmp/"
           overwrite: true
 
