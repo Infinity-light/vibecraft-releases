@@ -21,7 +21,41 @@ jobs:
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
           ref: ${{ github.event.client_payload.ref || 'main' }}
 
-      - name: Deploy landing to Aliyun
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Build landing
+        run: |
+          pnpm install --filter landing --frozen-lockfile
+          pnpm --filter landing build
+
+      - name: Prepare deploy bundle
+        run: |
+          mkdir -p /tmp/landing-bundle/apps/landing
+          cp -r apps/landing/dist /tmp/landing-bundle/apps/landing/
+          cp apps/landing/Dockerfile /tmp/landing-bundle/apps/landing/
+          cp apps/landing/nginx.conf /tmp/landing-bundle/apps/landing/
+          cp docker-compose.aliyun.yml /tmp/landing-bundle/
+          tar -czf landing-deploy.tar.gz -C /tmp/landing-bundle .
+
+      - name: Copy bundle to Aliyun
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.ALIYUN_HOST }}
+          username: ${{ secrets.ALIYUN_USER }}
+          key: ${{ secrets.ALIYUN_SSH_KEY }}
+          source: "landing-deploy.tar.gz"
+          target: "/tmp/"
+          overwrite: true
+
+      - name: Deploy on Aliyun
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.ALIYUN_HOST }}
@@ -30,10 +64,11 @@ jobs:
           command_timeout: 10m
           script: |
             set -e
+            mkdir -p /opt/apps/vibecraft-landing
             cd /opt/apps/vibecraft-landing
-            git fetch origin main || true
-            git reset --hard origin/main || true
+            tar -xzf /tmp/landing-deploy.tar.gz
+            rm -f /tmp/landing-deploy.tar.gz
             echo "=== Building and restarting ==="
-            docker compose -f docker-compose.aliyun.yml up -d --build
+            docker compose -f docker-compose.aliyun.yml up -d --build --no-cache
             docker image prune -f
             echo "=== Landing deployed ==="
