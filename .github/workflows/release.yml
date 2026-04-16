@@ -64,7 +64,7 @@ jobs:
           projectPath: apps/desktop
           tagName: ${{ github.event.client_payload.tag || github.event.inputs.tag }}
           releaseName: "VibeCraft ${{ github.event.client_payload.tag || github.event.inputs.tag }}"
-          releaseBody: "See the assets to download and install this version."
+          releaseBody: ""
           releaseDraft: false
           prerelease: false
           updaterJsonPreferNsis: true
