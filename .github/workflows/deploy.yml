@@ -41,15 +41,18 @@ jobs:
         run: |
           mkdir -p /tmp/deploy-bundle
           cp docker-compose.prod.yml /tmp/deploy-bundle/
+          cp .dockerignore /tmp/deploy-bundle/ 2>/dev/null || true
           mkdir -p /tmp/deploy-bundle/apps/server
+          cp apps/server/Dockerfile /tmp/deploy-bundle/apps/server/
           cp apps/server/package.json /tmp/deploy-bundle/apps/server/
           cp -r apps/server/dist /tmp/deploy-bundle/apps/server/
           if [ -d apps/server/migrations ]; then
             cp -r apps/server/migrations /tmp/deploy-bundle/apps/server/
           fi
           mkdir -p /tmp/deploy-bundle/apps/admin
-          cp -r apps/admin/dist /tmp/deploy-bundle/apps/admin/
+          cp apps/admin/Dockerfile /tmp/deploy-bundle/apps/admin/
           cp apps/admin/nginx.conf /tmp/deploy-bundle/apps/admin/
+          cp -r apps/admin/dist /tmp/deploy-bundle/apps/admin/
           mkdir -p /tmp/deploy-bundle/ops/nginx
           cp ops/nginx/vibecraft.conf /tmp/deploy-bundle/ops/nginx/
           tar -czf vibecraft-deploy.tar.gz -C /tmp/deploy-bundle .
@@ -144,16 +147,20 @@ jobs:
             echo "Running containers: $RUNNING"
             if [ "$RUNNING" -lt 3 ]; then
               echo "Expected 3 containers, only $RUNNING running"
+              docker ps --filter name=vibecraft
+              docker logs vibecraft-server-1 --tail 20 2>&1 || true
               exit 1
             fi
             for i in 1 2 3 4 5; do
-              STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/auth/me || true)
-              if [ "$STATUS" = "401" ]; then
-                echo "Health check passed"
+              RESP=$(curl -s http://127.0.0.1:3001/health || true)
+              STATUS=$(echo "$RESP" | grep -o '"status":"ok"' || true)
+              if [ -n "$STATUS" ]; then
+                echo "Health check passed: $RESP"
                 exit 0
               fi
-              echo "Attempt $i: HTTP $STATUS, retrying..."
+              echo "Attempt $i: $RESP, retrying..."
               sleep 5
             done
-            echo "Health check failed"
+            echo "Health check failed — last response: $RESP"
+            docker logs vibecraft-server-1 --tail 30 2>&1 || true
             exit 1
