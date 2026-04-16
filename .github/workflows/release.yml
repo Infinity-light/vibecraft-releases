@@ -23,6 +23,8 @@ jobs:
             target: aarch64-apple-darwin
           - platform: macos-latest
             target: x86_64-apple-darwin
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.platform }}
     env:
@@ -67,6 +69,19 @@ jobs:
           prerelease: false
           updaterJsonPreferNsis: true
           args: --target ${{ matrix.target }}
+
+      - name: Upload portable exe (Windows only)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+        run: |
+          $TAG = "${{ github.event.client_payload.tag || github.event.inputs.tag }}"
+          $VERSION = $TAG.TrimStart("v")
+          $SRC = "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/vibecraft.exe"
+          $DEST = "VibeCraft-${VERSION}-win-x64.exe"
+          Copy-Item $SRC $DEST
+          gh release upload $TAG $DEST --repo ${{ github.repository }} --clobber
+        shell: pwsh
 
   mirror-release:
     needs: [build-desktop]
