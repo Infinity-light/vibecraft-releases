@@ -1,0 +1,139 @@
+name: Deploy to VPS
+
+on:
+  repository_dispatch:
+    types: [deploy]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vibecraft
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: Infinity-light/vibecraft
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          ref: ${{ github.event.client_payload.ref || 'main' }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Build server and admin
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter server build
+          VITE_API_BASE="" pnpm --filter admin build
+
+      - name: Copy source and deploy to Tencent Cloud
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "."
+          target: "/opt/apps/vibecraft"
+          overwrite: true
+
+      - name: Build and deploy on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 18m
+          script: |
+            set -e
+            cd /opt/apps/vibecraft
+            echo "=== Writing .env ==="
+            : > .env
+            echo "NODE_ENV=production" >> .env
+            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> .env
+            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> .env
+            echo "OSS_AccessKey_ID=${{ secrets.OSS_AccessKey_ID }}" >> .env
+            echo "OSS_AccessKey_Secret=${{ secrets.OSS_AccessKey_Secret }}" >> .env
+            echo "OSS_BUCKET=${{ secrets.OSS_BUCKET }}" >> .env
+            echo "OSS_REGION=${{ secrets.OSS_REGION }}" >> .env
+            echo "=== Building images ==="
+            docker compose -f docker-compose.prod.yml build
+            echo "=== Starting containers ==="
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            echo "=== Waiting for postgres ==="
+            for i in 1 2 3 4 5 6; do
+              if docker exec vibecraft-postgres-1 pg_isready -U vibecraft >/dev/null 2>&1; then
+                echo "Postgres ready"
+                break
+              fi
+              echo "Waiting for postgres... ($i/6)"
+              sleep 5
+            done
+            if [ -d apps/server/migrations ]; then
+              for sql in $(ls apps/server/migrations/*.sql 2>/dev/null | sort); do
+                echo "Applying $sql"
+                docker exec -i vibecraft-postgres-1 \
+                  psql -U vibecraft -d vibecraft -v ON_ERROR_STOP=1 < "$sql"
+              done
+              docker restart vibecraft-server-1
+            fi
+            echo "=== Cleanup ==="
+            docker image prune -f
+
+      - name: Sync nginx config
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "ops/nginx/vibecraft.conf"
+          target: "/tmp/"
+          strip_components: 2
+
+      - name: Reload nginx
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sudo -n cp /tmp/vibecraft.conf /etc/nginx/sites-available/vibecraft
+            sudo -n nginx -t
+            sudo -n nginx -s reload
+
+      - name: Health check
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "Waiting for containers..."
+            sleep 10
+            RUNNING=$(docker ps --filter name=vibecraft --format '{{.Names}}' | wc -l)
+            echo "Running containers: $RUNNING"
+            if [ "$RUNNING" -lt 3 ]; then
+              echo "Expected 3 containers, only $RUNNING running"
+              exit 1
+            fi
+            for i in 1 2 3 4 5; do
+              STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/auth/me || true)
+              if [ "$STATUS" = "401" ]; then
+                echo "Health check passed"
+                exit 0
+              fi
+              echo "Attempt $i: HTTP $STATUS, retrying..."
+              sleep 5
+            done
+            echo "Health check failed"
+            exit 1
