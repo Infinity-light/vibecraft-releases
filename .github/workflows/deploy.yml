@@ -90,6 +90,7 @@ jobs:
             echo "OSS_AccessKey_Secret=${{ secrets.OSS_AccessKey_Secret }}" >> .env
             echo "OSS_BUCKET=${{ secrets.OSS_BUCKET }}" >> .env
             echo "OSS_REGION=${{ secrets.OSS_REGION }}" >> .env
+            echo "VERSIONS_API_TOKEN=${{ secrets.VERSIONS_API_TOKEN }}" >> .env
 
             echo "=== Building images ==="
             docker compose -f docker-compose.prod.yml build
