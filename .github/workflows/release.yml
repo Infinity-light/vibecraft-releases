@@ -105,7 +105,7 @@ jobs:
           OSS_REGION: ${{ secrets.OSS_REGION }}
         run: |
           if ! command -v ossutil >/dev/null 2>&1; then
-            curl -sSL https://gosspublic.alicdn.com/ossutil/1.7.21/ossutil64 \
+            curl -sSL https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64 \
               -o /usr/local/bin/ossutil
             chmod 755 /usr/local/bin/ossutil
           fi
