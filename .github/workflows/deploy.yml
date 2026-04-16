@@ -37,14 +37,32 @@ jobs:
           pnpm --filter server build
           VITE_API_BASE="" pnpm --filter admin build
 
-      - name: Copy source and deploy to Tencent Cloud
+      - name: Prepare deploy bundle
+        run: |
+          mkdir -p /tmp/deploy-bundle
+          cp docker-compose.prod.yml /tmp/deploy-bundle/
+          mkdir -p /tmp/deploy-bundle/apps/server
+          cp apps/server/package.json /tmp/deploy-bundle/apps/server/
+          cp -r apps/server/dist /tmp/deploy-bundle/apps/server/
+          if [ -d apps/server/migrations ]; then
+            cp -r apps/server/migrations /tmp/deploy-bundle/apps/server/
+          fi
+          mkdir -p /tmp/deploy-bundle/apps/admin
+          cp -r apps/admin/dist /tmp/deploy-bundle/apps/admin/
+          cp apps/admin/nginx.conf /tmp/deploy-bundle/apps/admin/
+          mkdir -p /tmp/deploy-bundle/ops/nginx
+          cp ops/nginx/vibecraft.conf /tmp/deploy-bundle/ops/nginx/
+          tar -czf /tmp/vibecraft-deploy.tar.gz -C /tmp/deploy-bundle .
+          ls -lh /tmp/vibecraft-deploy.tar.gz
+
+      - name: Copy deploy bundle to Tencent Cloud
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "."
-          target: "/opt/apps/vibecraft"
+          source: "/tmp/vibecraft-deploy.tar.gz"
+          target: "/tmp/"
           overwrite: true
 
       - name: Build and deploy on server
@@ -56,7 +74,13 @@ jobs:
           command_timeout: 18m
           script: |
             set -e
+            mkdir -p /opt/apps/vibecraft
             cd /opt/apps/vibecraft
+
+            echo "=== Extracting deploy bundle ==="
+            tar -xzf /tmp/vibecraft-deploy.tar.gz -C /opt/apps/vibecraft
+            rm -f /tmp/vibecraft-deploy.tar.gz
+
             echo "=== Writing .env ==="
             : > .env
             echo "NODE_ENV=production" >> .env
@@ -66,10 +90,13 @@ jobs:
             echo "OSS_AccessKey_Secret=${{ secrets.OSS_AccessKey_Secret }}" >> .env
             echo "OSS_BUCKET=${{ secrets.OSS_BUCKET }}" >> .env
             echo "OSS_REGION=${{ secrets.OSS_REGION }}" >> .env
+
             echo "=== Building images ==="
             docker compose -f docker-compose.prod.yml build
+
             echo "=== Starting containers ==="
             docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
             echo "=== Waiting for postgres ==="
             for i in 1 2 3 4 5 6; do
               if docker exec vibecraft-postgres-1 pg_isready -U vibecraft >/dev/null 2>&1; then
@@ -79,6 +106,7 @@ jobs:
               echo "Waiting for postgres... ($i/6)"
               sleep 5
             done
+
             if [ -d apps/server/migrations ]; then
               for sql in $(ls apps/server/migrations/*.sql 2>/dev/null | sort); do
                 echo "Applying $sql"
@@ -87,18 +115,9 @@ jobs:
               done
               docker restart vibecraft-server-1
             fi
+
             echo "=== Cleanup ==="
             docker image prune -f
-
-      - name: Sync nginx config
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "ops/nginx/vibecraft.conf"
-          target: "/tmp/"
-          strip_components: 2
 
       - name: Reload nginx
         uses: appleboy/ssh-action@v1
@@ -107,7 +126,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            sudo -n cp /tmp/vibecraft.conf /etc/nginx/sites-available/vibecraft
+            sudo -n cp /opt/apps/vibecraft/ops/nginx/vibecraft.conf /etc/nginx/sites-available/vibecraft
             sudo -n nginx -t
             sudo -n nginx -s reload
 
