@@ -78,11 +78,21 @@ jobs:
           script: |
             set -e
             DEPLOY_DIR=/opt/apps/vibecraft-landing-deploy
+
+            # Stop ALL old landing containers to free port 8092
+            echo "=== Stopping old containers ==="
+            cd /opt/apps/vibecraft-landing 2>/dev/null && docker compose down 2>/dev/null || true
+            cd /opt/apps/vibecraft-landing 2>/dev/null && docker compose -f docker-compose.aliyun.yml down 2>/dev/null || true
+            docker stop vibecraft-landing 2>/dev/null && docker rm vibecraft-landing 2>/dev/null || true
+            cd "$DEPLOY_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
+
+            # Extract new bundle
             mkdir -p "$DEPLOY_DIR"
             cd "$DEPLOY_DIR"
             tar -xzf /tmp/landing-deploy.tar.gz
             rm -f /tmp/landing-deploy.tar.gz
-            echo "=== Building and restarting ==="
+
+            echo "=== Building and starting ==="
             docker compose up -d --build --force-recreate
             docker image prune -f
             echo "=== Landing deployed ==="
