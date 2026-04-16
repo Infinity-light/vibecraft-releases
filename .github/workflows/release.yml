@@ -1,0 +1,192 @@
+name: Release
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.3.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+
+    runs-on: ${{ matrix.platform }}
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Infinity-light/vibecraft
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          ref: ${{ github.event.client_payload.tag || github.event.inputs.tag }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - run: pnpm install
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_BUNDLER_DMG_IGNORE_CI: "1"
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.event.client_payload.tag || github.event.inputs.tag }}
+          releaseName: "VibeCraft ${{ github.event.client_payload.tag || github.event.inputs.tag }}"
+          releaseBody: "See the assets to download and install this version."
+          releaseDraft: false
+          prerelease: false
+          updaterJsonPreferNsis: true
+          args: --target ${{ matrix.target }}
+
+  mirror-release:
+    needs: [build-desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets from private repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+        run: |
+          mkdir -p /tmp/assets
+          TAG="${{ github.event.client_payload.tag || github.event.inputs.tag }}"
+          gh release download "$TAG" \
+            --dir /tmp/assets \
+            --repo Infinity-light/vibecraft
+
+      - name: Publish to mirror repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+        run: |
+          TAG="${{ github.event.client_payload.tag || github.event.inputs.tag }}"
+          gh release create "$TAG" \
+            --repo ${{ github.repository }} \
+            --title "VibeCraft $TAG" \
+            --notes "See https://github.com/Infinity-light/vibecraft/releases/tag/$TAG" \
+            /tmp/assets/* \
+          || gh release upload "$TAG" \
+              /tmp/assets/* \
+              --repo ${{ github.repository }} \
+              --clobber
+
+      - name: Upload release assets to OSS
+        env:
+          OSS_AccessKey_ID: ${{ secrets.OSS_AccessKey_ID }}
+          OSS_AccessKey_Secret: ${{ secrets.OSS_AccessKey_Secret }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+          OSS_REGION: ${{ secrets.OSS_REGION }}
+        run: |
+          if ! command -v ossutil >/dev/null 2>&1; then
+            curl -sSL https://gosspublic.alicdn.com/ossutil/1.7.21/ossutil64 \
+              -o /usr/local/bin/ossutil
+            chmod 755 /usr/local/bin/ossutil
+          fi
+          TAG="${{ github.event.client_payload.tag || github.event.inputs.tag }}"
+          ossutil -e "${OSS_REGION}.aliyuncs.com" \
+            -i "${OSS_AccessKey_ID}" \
+            -k "${OSS_AccessKey_Secret}" \
+            cp -r /tmp/assets/ "oss://${OSS_BUCKET}/releases/${TAG}/" --update
+          echo "OSS upload complete: oss://${OSS_BUCKET}/releases/${TAG}/"
+
+  notify-server:
+    needs: [mirror-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest.json from mirror repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+        run: |
+          mkdir -p /tmp/release
+          TAG="${{ github.event.client_payload.tag || github.event.inputs.tag }}"
+          gh release download "$TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "latest.json" \
+            --dir /tmp/release
+          cat /tmp/release/latest.json
+
+      - name: POST version to server
+        env:
+          VERSIONS_API_URL: https://vibecraft-manage.godpenai.com/admin/versions
+          VERSIONS_API_TOKEN: ${{ secrets.VERSIONS_API_TOKEN }}
+          OSS_BUCKET: ${{ secrets.OSS_BUCKET }}
+          OSS_REGION: ${{ secrets.OSS_REGION }}
+          OSS_PUBLIC_DOMAIN: ${{ secrets.OSS_PUBLIC_DOMAIN }}
+        run: |
+          VERSION=$(jq -r '.version' /tmp/release/latest.json)
+          NOTES=$(jq -r '.notes // ""' /tmp/release/latest.json)
+          PUB_DATE=$(jq -r '.pub_date' /tmp/release/latest.json)
+          TAG="${{ github.event.client_payload.tag || github.event.inputs.tag }}"
+
+          if [ -n "${OSS_PUBLIC_DOMAIN}" ]; then
+            OSS_BASE="https://${OSS_PUBLIC_DOMAIN}/releases/${TAG}"
+          else
+            OSS_BASE="https://${OSS_BUCKET}.${OSS_REGION}.aliyuncs.com/releases/${TAG}"
+          fi
+
+          SIG_ARM=$(jq -r '.platforms["darwin-aarch64"].signature // ""' /tmp/release/latest.json)
+          SIG_X64=$(jq -r '.platforms["darwin-x86_64"].signature // ""' /tmp/release/latest.json)
+          ARM_FILE=$(jq -r '.platforms["darwin-aarch64"].url // ""' /tmp/release/latest.json | sed 's|.*/||')
+          X64_FILE=$(jq -r '.platforms["darwin-x86_64"].url // ""' /tmp/release/latest.json | sed 's|.*/||')
+
+          PLATFORMS=$(jq -n \
+            --arg arm_url "${OSS_BASE}/${ARM_FILE}" \
+            --arg arm_sig "$SIG_ARM" \
+            --arg x64_url "${OSS_BASE}/${X64_FILE}" \
+            --arg x64_sig "$SIG_X64" \
+            --arg win_url "${OSS_BASE}/VibeCraft-${VERSION}-win-x64.exe" \
+            '{
+              "darwin-aarch64": {"url": $arm_url, "signature": $arm_sig},
+              "darwin-x86_64":  {"url": $x64_url, "signature": $x64_sig},
+              "windows-x86_64": {"url": $win_url, "signature": ""}
+            }')
+
+          BODY=$(jq -n \
+            --arg v "$VERSION" \
+            --arg n "$NOTES" \
+            --arg d "$PUB_DATE" \
+            --argjson p "$PLATFORMS" \
+            '{version: $v, releaseNotes: $n, pubDate: $d, platforms: $p, isActive: true}')
+
+          echo "$BODY"
+
+          HTTP_CODE=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
+            -X POST "$VERSIONS_API_URL" \
+            -H "X-Versions-Token: $VERSIONS_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          echo "Response ($HTTP_CODE):"
+          cat /tmp/resp.json
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "::error::Server notification failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
