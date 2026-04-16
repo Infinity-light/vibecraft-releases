@@ -72,7 +72,7 @@ jobs:
     needs: [build-desktop]
     runs-on: ubuntu-latest
     steps:
-      - name: Download release assets from private repo
+      - name: Download release assets from current repo
         env:
           GH_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
         run: |
@@ -80,7 +80,7 @@ jobs:
           TAG="${{ github.event.client_payload.tag || github.event.inputs.tag }}"
           gh release download "$TAG" \
             --dir /tmp/assets \
-            --repo Infinity-light/vibecraft
+            --repo ${{ github.repository }}
 
       - name: Publish to mirror repo
         env:
@@ -164,7 +164,7 @@ jobs:
             --arg win_url "${OSS_BASE}/VibeCraft-${VERSION}-win-x64.exe" \
             '{
               "darwin-aarch64": {"url": $arm_url, "signature": $arm_sig},
-              "darwin-x86_64":  {"url": $x64_url, "signature": $sig_x64},
+              "darwin-x86_64":  {"url": $x64_url, "signature": $x64_sig},
               "windows-x86_64": {"url": $win_url, "signature": ""}
             }')
 
