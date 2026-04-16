@@ -1,0 +1,39 @@
+name: Deploy Landing Page
+
+on:
+  repository_dispatch:
+    types: [deploy-landing]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-landing
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: Infinity-light/vibecraft
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          ref: ${{ github.event.client_payload.ref || 'main' }}
+
+      - name: Deploy landing to Aliyun
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.ALIYUN_HOST }}
+          username: ${{ secrets.ALIYUN_USER }}
+          key: ${{ secrets.ALIYUN_SSH_KEY }}
+          command_timeout: 10m
+          script: |
+            set -e
+            cd /opt/apps/vibecraft-landing
+            git fetch origin main || true
+            git reset --hard origin/main || true
+            echo "=== Building and restarting ==="
+            docker compose -f docker-compose.aliyun.yml up -d --build
+            docker image prune -f
+            echo "=== Landing deployed ==="
