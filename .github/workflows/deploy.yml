@@ -134,33 +134,57 @@ jobs:
             sudo -n nginx -t
             sudo -n nginx -s reload
 
-      - name: Health check
+      - name: Health check (boot + 60s stability window)
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 3m
           script: |
-            echo "Waiting for containers..."
+            echo "=== Phase 1: boot check ==="
             sleep 10
             RUNNING=$(docker ps --filter name=vibecraft --format '{{.Names}}' | wc -l)
             echo "Running containers: $RUNNING"
             if [ "$RUNNING" -lt 3 ]; then
               echo "Expected 3 containers, only $RUNNING running"
               docker ps --filter name=vibecraft
-              docker logs vibecraft-server-1 --tail 20 2>&1 || true
+              docker logs vibecraft-server-1 --tail 30 2>&1 || true
               exit 1
             fi
+
+            STATUS=""
             for i in 1 2 3 4 5; do
               RESP=$(curl -s http://127.0.0.1:3001/health || true)
               STATUS=$(echo "$RESP" | grep -o '"status":"ok"' || true)
               if [ -n "$STATUS" ]; then
-                echo "Health check passed: $RESP"
-                exit 0
+                echo "Boot /health passed: $RESP"
+                break
               fi
               echo "Attempt $i: $RESP, retrying..."
               sleep 5
             done
-            echo "Health check failed — last response: $RESP"
-            docker logs vibecraft-server-1 --tail 30 2>&1 || true
-            exit 1
+            if [ -z "$STATUS" ]; then
+              echo "Boot health check failed — last response: $RESP"
+              docker logs vibecraft-server-1 --tail 50 2>&1 || true
+              exit 1
+            fi
+
+            echo "=== Phase 2: stability observation (60s window) ==="
+            sleep 60
+            RESTARTS=$(docker inspect vibecraft-server-1 --format '{{.RestartCount}}')
+            echo "Server RestartCount after 60s: $RESTARTS"
+            if [ "$RESTARTS" -gt 0 ]; then
+              echo "FAIL: server crash-looped within stability window (RestartCount=$RESTARTS)"
+              docker logs vibecraft-server-1 --tail 80 2>&1 || true
+              exit 1
+            fi
+
+            FINAL_RESP=$(curl -s http://127.0.0.1:3001/health || true)
+            FINAL_STATUS=$(echo "$FINAL_RESP" | grep -o '"status":"ok"' || true)
+            if [ -z "$FINAL_STATUS" ]; then
+              echo "FAIL: /health degraded after stability window: $FINAL_RESP"
+              docker logs vibecraft-server-1 --tail 50 2>&1 || true
+              exit 1
+            fi
+            echo "Stability observation passed: $FINAL_RESP"
