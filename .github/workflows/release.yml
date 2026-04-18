@@ -237,13 +237,25 @@ jobs:
           ARM_FILE=$(jq -r '.platforms["darwin-aarch64"].url // ""' /tmp/release/latest.json | sed 's|.*/||')
           X64_FILE=$(jq -r '.platforms["darwin-x86_64"].url // ""' /tmp/release/latest.json | sed 's|.*/||')
 
-          # Read the Windows portable .sig and base64-encode it. `base64 -w 0`
-          # disables line wrapping so the resulting string is a single token
-          # the JSON payload can carry unescaped.
+          # Tauri's `signer sign` writes the signature as already-base64 text
+          # into the .sig file (first line starts with `dW50...` = base64 of
+          # "untrusted comment:..."). Tauri's own bundler inlines that exact
+          # string into latest.json for the macOS platforms, and the desktop
+          # client's verify_minisign does exactly ONE base64 decode before
+          # feeding the result into Signature::decode.
+          #
+          # Therefore: take the .sig content AS-IS. Do NOT re-encode. The
+          # previous attempt ran `base64 -w 0 < .sig` which double-encoded
+          # the Windows signature, making the client fail with "invalid
+          # encoding in minisign data" after its single decode left another
+          # base64 string instead of minisign text.
+          #
+          # `tr -d '\n\r'` strips any trailing newline the signer tool may
+          # have appended, so the resulting JSON token is a clean single line.
           SIG_WIN=""
           SIG_WIN_FILE=$(ls /tmp/release/VibeCraft-*-win-x64.exe.sig 2>/dev/null | head -1 || true)
           if [ -n "$SIG_WIN_FILE" ] && [ -s "$SIG_WIN_FILE" ]; then
-            SIG_WIN=$(base64 -w 0 < "$SIG_WIN_FILE")
+            SIG_WIN=$(tr -d '\n\r' < "$SIG_WIN_FILE")
           fi
 
           # Contract: refuse to advertise a release whose auto-update path is
@@ -301,30 +313,58 @@ jobs:
           fi
 
       # Post-deploy contract test: hit the live /updates/latest endpoint as
-      # the desktop client will, assert every advertised platform has a
-      # non-empty signature. This is the end-to-end check that closes the
-      # loop between "CI believed it posted" and "server actually serves it".
+      # the desktop client will, verify every advertised platform has a
+      # signature that actually decodes into minisign format.
+      #
+      # We check non-empty AND correctly single-base64-encoded (one decode
+      # yields text starting with "untrusted comment:"). The second check
+      # catches the class of bug where the CI accidentally double-encodes
+      # the signature — the symptom on the client is cryptic ("Download
+      # update failed signature check, decode minisign signature: invalid
+      # encoding in minisign data"), and the only way to catch it before
+      # a user hits it is to actually perform the decode here.
       - name: Post-deploy contract test — /updates/latest signatures
         run: |
           set -euo pipefail
 
-          # Hit three times over ~10s so a CDN/backend cache-warm race isn't
-          # reported as a hard failure. All three must agree.
           for target in windows-x86_64 darwin-aarch64 darwin-x86_64; do
+            # Retry 3x over ~10s to absorb any CDN / backend cache-warm race.
             for attempt in 1 2 3; do
               RESP=$(curl -sS "https://vibecraft-manage.godpenai.com/updates/latest?current_version=0.0.0&target=${target}")
               SIG=$(echo "$RESP" | jq -r ".platforms[\"${target}\"].signature // \"\"")
-              if [ -n "$SIG" ]; then
-                echo "OK  ${target} (attempt ${attempt})"
-                break
+
+              if [ -z "$SIG" ]; then
+                if [ "$attempt" = "3" ]; then
+                  echo "::error title=Contract test failed::${target} signature is empty"
+                  echo "$RESP" | jq '.'
+                  exit 1
+                fi
+                sleep 3
+                continue
               fi
-              if [ "$attempt" = "3" ]; then
-                echo "::error title=Contract test failed::Live /updates/latest returns empty signature for ${target}"
-                echo "$RESP" | jq '.'
-                exit 1
-              fi
-              echo "retry ${target} (attempt ${attempt})"
-              sleep 3
+
+              # Decode once. Expected: minisign text starting with
+              # "untrusted comment:". If we see "dW50..." (base64 for
+              # "untrusted") the signature is double-encoded.
+              DECODED_HEAD=$(echo -n "$SIG" | base64 -d 2>/dev/null | head -c 20 || echo "")
+              case "$DECODED_HEAD" in
+                "untrusted comment:"*)
+                  echo "OK  ${target} (attempt ${attempt}) — decodes to minisign text"
+                  break
+                  ;;
+                dW50*)
+                  echo "::error title=Contract test failed::${target} signature is DOUBLE-base64-encoded (decoded head: $DECODED_HEAD...)"
+                  echo "The .sig file produced by \`tauri signer sign\` is already base64. Read it as-is, don't re-encode."
+                  exit 1
+                  ;;
+                *)
+                  if [ "$attempt" = "3" ]; then
+                    echo "::error title=Contract test failed::${target} signature decoded to unexpected bytes (expected 'untrusted comment:' prefix, got '$DECODED_HEAD')"
+                    exit 1
+                  fi
+                  sleep 3
+                  ;;
+              esac
             done
           done
-          echo "✓ All platform signatures are non-empty on live endpoint"
+          echo "✓ All platform signatures present, single-encoded, decode to minisign format"
