@@ -70,17 +70,55 @@ jobs:
           updaterJsonPreferNsis: true
           args: --target ${{ matrix.target }}
 
-      - name: Upload portable exe (Windows only)
+      # Windows portable .exe bypasses Tauri's bundler, so it also bypasses the
+      # bundler's minisign signing. We sign it ourselves here with the SAME
+      # TAURI_SIGNING_PRIVATE_KEY used for the macOS .app/.dmg — the desktop
+      # client's `verify_minisign` path (update.rs) validates against the baked
+      # pubkey regardless of which file the signature came from.
+      #
+      # Historical context: v0.4.0 → v0.6.3 shipped with an empty signature for
+      # the Windows portable, which meant the `useUpdater.ts` safety gate
+      # refused to auto-install on every Windows self-update (toast: "服务端
+      # 缺少签名信息"). Fixed in v0.6.4 by adding this step + the notify-server
+      # signature propagation below.
+      - name: Sign portable exe (Windows only)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         env:
           GH_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           $TAG = "${{ github.event.client_payload.tag || github.event.inputs.tag }}"
           $VERSION = $TAG.TrimStart("v")
           $SRC = "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/vibecraft.exe"
           $DEST = "VibeCraft-${VERSION}-win-x64.exe"
           Copy-Item $SRC $DEST
-          gh release upload $TAG $DEST --repo ${{ github.repository }} --clobber
+
+          # `tauri signer sign` accepts the key as a string or file path. A
+          # base64 minisign key is ~200 chars, well under Windows cmdline
+          # limits, so inline is fine.
+          pnpm --filter desktop exec tauri signer sign `
+            --private-key "$env:TAURI_SIGNING_PRIVATE_KEY" `
+            --password "$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" `
+            $DEST
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "tauri signer sign failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+
+          # Fail loudly if the .sig file didn't materialize or is empty. We
+          # used to accept "best-effort" signing, which is exactly how the
+          # empty-signature bug shipped for six releases.
+          if (-not (Test-Path "${DEST}.sig")) {
+            Write-Error "Expected ${DEST}.sig but file was not produced"
+            exit 1
+          }
+          if ((Get-Item "${DEST}.sig").Length -eq 0) {
+            Write-Error "${DEST}.sig was produced but is empty"
+            exit 1
+          }
+
+          gh release upload $TAG $DEST "${DEST}.sig" --repo ${{ github.repository }} --clobber
         shell: pwsh
 
   mirror-release:
@@ -135,7 +173,7 @@ jobs:
     needs: [mirror-release]
     runs-on: ubuntu-latest
     steps:
-      - name: Download latest.json from mirror repo
+      - name: Download release metadata from mirror repo
         env:
           GH_TOKEN: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
         run: |
@@ -145,7 +183,21 @@ jobs:
             --repo ${{ github.repository }} \
             --pattern "latest.json" \
             --dir /tmp/release
+
+          # Pull the Windows portable .sig so we can base64-encode its content
+          # into the `windows-x86_64.signature` field. The desktop client's
+          # `verify_minisign` in `apps/desktop/src-tauri/src/commands/update.rs`
+          # expects base64(<raw .sig file content>) — matching the format that
+          # Tauri's bundler writes into latest.json for the macOS entries.
+          gh release download "$TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "VibeCraft-*-win-x64.exe.sig" \
+            --dir /tmp/release
+
+          echo "--- latest.json ---"
           cat /tmp/release/latest.json
+          echo "--- Windows .sig presence ---"
+          ls -la /tmp/release/VibeCraft-*-win-x64.exe.sig
 
       - name: POST version to server
         env:
@@ -155,6 +207,8 @@ jobs:
           OSS_REGION: ${{ secrets.OSS_REGION }}
           OSS_PUBLIC_DOMAIN: ${{ secrets.OSS_PUBLIC_DOMAIN }}
         run: |
+          set -euo pipefail
+
           VERSION=$(jq -r '.version' /tmp/release/latest.json)
           NOTES=$(jq -r '.notes // ""' /tmp/release/latest.json)
           PUB_DATE=$(jq -r '.pub_date' /tmp/release/latest.json)
@@ -171,16 +225,43 @@ jobs:
           ARM_FILE=$(jq -r '.platforms["darwin-aarch64"].url // ""' /tmp/release/latest.json | sed 's|.*/||')
           X64_FILE=$(jq -r '.platforms["darwin-x86_64"].url // ""' /tmp/release/latest.json | sed 's|.*/||')
 
+          # Read the Windows portable .sig and base64-encode it. `base64 -w 0`
+          # disables line wrapping so the resulting string is a single token
+          # the JSON payload can carry unescaped.
+          SIG_WIN=""
+          SIG_WIN_FILE=$(ls /tmp/release/VibeCraft-*-win-x64.exe.sig 2>/dev/null | head -1 || true)
+          if [ -n "$SIG_WIN_FILE" ] && [ -s "$SIG_WIN_FILE" ]; then
+            SIG_WIN=$(base64 -w 0 < "$SIG_WIN_FILE")
+          fi
+
+          # Contract: refuse to advertise a release whose auto-update path is
+          # broken. An empty signature on any advertised platform is a bug,
+          # not a degraded-but-acceptable state — the desktop client will
+          # refuse to install anyway (useUpdater.ts), and shipping a record
+          # here only moves the confusion to the user instead of the log.
+          MISSING=""
+          [ -z "$SIG_ARM" ] && MISSING="$MISSING darwin-aarch64"
+          [ -z "$SIG_X64" ] && MISSING="$MISSING darwin-x86_64"
+          [ -z "$SIG_WIN" ] && MISSING="$MISSING windows-x86_64"
+          if [ -n "$MISSING" ]; then
+            echo "::error title=Missing signatures::Refusing to publish release $TAG — empty signature(s) for:${MISSING}"
+            echo "  darwin-aarch64:  $([ -n "$SIG_ARM" ] && echo OK || echo EMPTY)"
+            echo "  darwin-x86_64:   $([ -n "$SIG_X64" ] && echo OK || echo EMPTY)"
+            echo "  windows-x86_64:  $([ -n "$SIG_WIN" ] && echo OK || echo EMPTY)"
+            exit 1
+          fi
+
           PLATFORMS=$(jq -n \
             --arg arm_url "${OSS_BASE}/${ARM_FILE}" \
             --arg arm_sig "$SIG_ARM" \
             --arg x64_url "${OSS_BASE}/${X64_FILE}" \
             --arg x64_sig "$SIG_X64" \
             --arg win_url "${OSS_BASE}/VibeCraft-${VERSION}-win-x64.exe" \
+            --arg win_sig "$SIG_WIN" \
             '{
               "darwin-aarch64": {"url": $arm_url, "signature": $arm_sig},
               "darwin-x86_64":  {"url": $x64_url, "signature": $x64_sig},
-              "windows-x86_64": {"url": $win_url, "signature": ""}
+              "windows-x86_64": {"url": $win_url, "signature": $win_sig}
             }')
 
           BODY=$(jq -n \
@@ -190,7 +271,8 @@ jobs:
             --argjson p "$PLATFORMS" \
             '{version: $v, releaseNotes: $n, pubDate: $d, platforms: $p, isActive: true}')
 
-          echo "$BODY"
+          # Log without the signature content so the job log stays readable.
+          jq 'del(.platforms[].signature) | .platforms[] += {signature: "(non-empty)"}' <<< "$BODY"
 
           HTTP_CODE=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
             -X POST "$VERSIONS_API_URL" \
@@ -205,3 +287,32 @@ jobs:
             echo "::error::Server notification failed with HTTP $HTTP_CODE"
             exit 1
           fi
+
+      # Post-deploy contract test: hit the live /updates/latest endpoint as
+      # the desktop client will, assert every advertised platform has a
+      # non-empty signature. This is the end-to-end check that closes the
+      # loop between "CI believed it posted" and "server actually serves it".
+      - name: Post-deploy contract test — /updates/latest signatures
+        run: |
+          set -euo pipefail
+
+          # Hit three times over ~10s so a CDN/backend cache-warm race isn't
+          # reported as a hard failure. All three must agree.
+          for target in windows-x86_64 darwin-aarch64 darwin-x86_64; do
+            for attempt in 1 2 3; do
+              RESP=$(curl -sS "https://vibecraft-manage.godpenai.com/updates/latest?current_version=0.0.0&target=${target}")
+              SIG=$(echo "$RESP" | jq -r ".platforms[\"${target}\"].signature // \"\"")
+              if [ -n "$SIG" ]; then
+                echo "OK  ${target} (attempt ${attempt})"
+                break
+              fi
+              if [ "$attempt" = "3" ]; then
+                echo "::error title=Contract test failed::Live /updates/latest returns empty signature for ${target}"
+                echo "$RESP" | jq '.'
+                exit 1
+              fi
+              echo "retry ${target} (attempt ${attempt})"
+              sleep 3
+            done
+          done
+          echo "✓ All platform signatures are non-empty on live endpoint"
