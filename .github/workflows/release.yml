@@ -94,13 +94,25 @@ jobs:
           $DEST = "VibeCraft-${VERSION}-win-x64.exe"
           Copy-Item $SRC $DEST
 
-          # `tauri signer sign` accepts the key as a string or file path. A
-          # base64 minisign key is ~200 chars, well under Windows cmdline
-          # limits, so inline is fine.
+          # `tauri signer sign` has `--password` as a REQUIRED flag. Our signing
+          # key was generated without a password, so the secret is an empty
+          # string. Passing `--password ""` as two tokens is unreliable under
+          # PowerShell → native-command forwarding: `""` gets silently dropped,
+          # CLAP then consumes the next positional arg (our FILE) as the
+          # --password value, and sign() fails with "<FILE> not provided".
+          #
+          # The fix is the attached-equals form `--flag=value`. Wrapped in a
+          # double-quoted PS string, the whole thing is ONE argv token so the
+          # empty value survives transport and CLAP parses `--password=""`
+          # correctly. Same treatment for --private-key for symmetry.
+          #
+          # `pnpm --filter desktop exec` runs from apps/desktop, so we also
+          # resolve $DEST to an absolute path before handing it off.
+          $DEST_ABS = (Resolve-Path $DEST).Path
           pnpm --filter desktop exec tauri signer sign `
-            --private-key "$env:TAURI_SIGNING_PRIVATE_KEY" `
-            --password "$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" `
-            $DEST
+            "--private-key=$env:TAURI_SIGNING_PRIVATE_KEY" `
+            "--password=$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD" `
+            "$DEST_ABS"
           if ($LASTEXITCODE -ne 0) {
             Write-Error "tauri signer sign failed with exit code $LASTEXITCODE"
             exit 1
