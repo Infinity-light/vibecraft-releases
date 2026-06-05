@@ -131,6 +131,21 @@ jobs:
           }
 
           gh release upload $TAG $DEST "${DEST}.sig" --repo ${{ github.repository }} --clobber
+
+          # Also ship a .zip-wrapped copy of the portable exe for the download
+          # page. Browsers flag (and Edge/Chrome SmartScreen sometimes block) a
+          # bare .exe download; a .zip sails through the download stage. This is
+          # download-page only — the desktop auto-updater keeps using the raw
+          # .exe via latest.json, so the .sig signing above is untouched.
+          #
+          # The zip propagates downstream automatically: mirror-release
+          # downloads every release asset and `ossutil cp -r` uploads them to
+          # oss://.../releases/$TAG/, which is exactly where the server's
+          # /updates/latest HEAD-checks for the win-x64.zip object before
+          # advertising it on the landing page.
+          $ZIP = "VibeCraft-${VERSION}-win-x64.zip"
+          Compress-Archive -Path $DEST -DestinationPath $ZIP -Force
+          gh release upload $TAG $ZIP --repo ${{ github.repository }} --clobber
         shell: pwsh
 
   mirror-release:
