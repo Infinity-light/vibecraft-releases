@@ -1,9 +1,15 @@
 name: Deploy to VPS
 
 on:
-  repository_dispatch:
-    types: [deploy]
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact private VibeCraft source commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 concurrency:
   group: deploy-vibecraft
@@ -14,12 +20,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: Require an immutable source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+
       - name: Checkout private source
         uses: actions/checkout@v4
         with:
           repository: Infinity-light/vibecraft
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
-          ref: ${{ github.event.client_payload.ref || 'main' }}
+          ref: ${{ inputs.source_sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -31,160 +42,69 @@ jobs:
         with:
           version: 10
 
-      - name: Build server and admin
+      - name: Build and test the server
         run: |
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --filter server...
+          pnpm --filter server test --runInBand --silent
           pnpm --filter server build
-          VITE_API_BASE="" pnpm --filter admin build
+          tar -czf "vibecraft-server-dist-${{ github.run_id }}.tgz" -C apps/server dist
 
-      - name: Prepare deploy bundle
-        run: |
-          mkdir -p /tmp/deploy-bundle
-          cp docker-compose.prod.yml /tmp/deploy-bundle/
-          cp .dockerignore /tmp/deploy-bundle/ 2>/dev/null || true
-          mkdir -p /tmp/deploy-bundle/apps/server
-          cp apps/server/Dockerfile /tmp/deploy-bundle/apps/server/
-          cp apps/server/package.json /tmp/deploy-bundle/apps/server/
-          cp -r apps/server/dist /tmp/deploy-bundle/apps/server/
-          if [ -d apps/server/migrations ]; then
-            cp -r apps/server/migrations /tmp/deploy-bundle/apps/server/
-          fi
-          mkdir -p /tmp/deploy-bundle/apps/admin
-          cp apps/admin/Dockerfile /tmp/deploy-bundle/apps/admin/
-          cp apps/admin/nginx.conf /tmp/deploy-bundle/apps/admin/
-          cp -r apps/admin/dist /tmp/deploy-bundle/apps/admin/
-          mkdir -p /tmp/deploy-bundle/ops/nginx
-          cp ops/nginx/vibecraft.conf /tmp/deploy-bundle/ops/nginx/
-          tar -czf vibecraft-deploy.tar.gz -C /tmp/deploy-bundle .
-          ls -lh vibecraft-deploy.tar.gz
-
-      - name: Copy deploy bundle to Tencent Cloud
+      - name: Transfer compiled server to the VPS
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "vibecraft-deploy.tar.gz"
-          target: "/tmp/"
-          overwrite: true
+          source: vibecraft-server-dist-${{ github.run_id }}.tgz
+          target: /tmp/
 
-      - name: Build and deploy on server
+      - name: Deploy the server and verify marketplace routes
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          command_timeout: 18m
+          command_timeout: 12m
           script: |
-            set -e
-            mkdir -p /opt/apps/vibecraft
+            set -eu
             cd /opt/apps/vibecraft
-
-            echo "=== Extracting deploy bundle ==="
-            tar -xzf /tmp/vibecraft-deploy.tar.gz -C /opt/apps/vibecraft
-            rm -f /tmp/vibecraft-deploy.tar.gz
-
-            echo "=== Writing .env ==="
-            : > .env
-            echo "NODE_ENV=production" >> .env
-            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" >> .env
-            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> .env
-            echo "OSS_AccessKey_ID=${{ secrets.OSS_AccessKey_ID }}" >> .env
-            echo "OSS_AccessKey_Secret=${{ secrets.OSS_AccessKey_Secret }}" >> .env
-            echo "OSS_BUCKET=${{ secrets.OSS_BUCKET }}" >> .env
-            echo "OSS_REGION=${{ secrets.OSS_REGION }}" >> .env
-            echo "VERSIONS_API_TOKEN=${{ secrets.VERSIONS_API_TOKEN }}" >> .env
-
-            echo "=== Building images ==="
-            docker compose -f docker-compose.prod.yml build
-
-            echo "=== Starting containers ==="
-            docker compose -f docker-compose.prod.yml up -d --remove-orphans
-
-            echo "=== Waiting for postgres ==="
-            for i in 1 2 3 4 5 6; do
-              if docker exec vibecraft-postgres-1 pg_isready -U vibecraft >/dev/null 2>&1; then
-                echo "Postgres ready"
-                break
+            test -s .env
+            test -d apps/server/dist
+            compose() { docker compose -f docker-compose.prod.yml "$@"; }
+            compose config --quiet
+            old_container=$(compose ps -q server)
+            test -n "$old_container"
+            old_image=$(docker inspect --format '{{.Image}}' "$old_container")
+            image_ref=$(docker inspect --format '{{.Config.Image}}' "$old_container")
+            test "$(docker inspect --format '{{.State.Running}}' "$old_container")" = true
+            stage=$(mktemp -d apps/server/.retire-frontend-design.XXXXXX)
+            tar -xzf "/tmp/vibecraft-server-dist-${{ github.run_id }}.tgz" -C "$stage"
+            test -s "$stage/dist/skills/utils/available-version.js"
+            rollback() {
+              code=$?
+              if [ "$code" -ne 0 ] && [ -d "$stage/previous-dist" ]; then
+                if [ -d apps/server/dist ]; then mv apps/server/dist "$stage/failed-dist"; fi
+                mv "$stage/previous-dist" apps/server/dist
+                docker image tag "$old_image" "$image_ref"
+                compose up -d --no-deps --no-build server
               fi
-              echo "Waiting for postgres... ($i/6)"
-              sleep 5
+            }
+            trap rollback EXIT
+            mv apps/server/dist "$stage/previous-dist"
+            mv "$stage/dist" apps/server/dist
+            compose build server
+            compose up -d --no-deps --no-build server
+            api=http://127.0.0.1:3001
+            curl -fsS --retry 12 --retry-delay 2 --retry-all-errors "$api/health" >/dev/null
+            for entry in \
+              '6dcf8acd-40f1-4336-83f5-6d87b821ea16 5.39.0 6.3.0' \
+              '141ebf99-59a4-4b8d-8ebb-b524a826cbee 5.33.1-codex.5 6.2.0%2Bcodex.20261127' \
+              '5079be08-185b-4737-8cd1-513210b8b6f5 1.0.0 1.0.1'
+            do
+              set -- $entry
+              test "$(curl -sS -o /dev/null -w '%{http_code}' "$api/skills/$1/files?version=$2")" = 404
+              curl -fsS "$api/skills/$1/files?version=$3" >/dev/null
+              printf 'Verified historical %s withdrawn and current %s available\n' "$2" "$3"
             done
-
-            if [ -d apps/server/migrations ]; then
-              for sql in $(ls apps/server/migrations/*.sql 2>/dev/null | sort); do
-                echo "Applying $sql"
-                docker exec -i vibecraft-postgres-1 \
-                  psql -U vibecraft -d vibecraft -v ON_ERROR_STOP=1 < "$sql"
-              done
-              docker restart vibecraft-server-1
-            fi
-
-            echo "=== Cleanup ==="
-            docker image prune -f
-
-      - name: Reload nginx
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            sudo -n cp /opt/apps/vibecraft/ops/nginx/vibecraft.conf /etc/nginx/sites-available/vibecraft
-            sudo -n nginx -t
-            sudo -n nginx -s reload
-
-      - name: Health check (boot + 60s stability window)
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          command_timeout: 3m
-          script: |
-            echo "=== Phase 1: boot check ==="
-            sleep 10
-            RUNNING=$(docker ps --filter name=vibecraft --format '{{.Names}}' | wc -l)
-            echo "Running containers: $RUNNING"
-            if [ "$RUNNING" -lt 3 ]; then
-              echo "Expected 3 containers, only $RUNNING running"
-              docker ps --filter name=vibecraft
-              docker logs vibecraft-server-1 --tail 30 2>&1 || true
-              exit 1
-            fi
-
-            STATUS=""
-            for i in 1 2 3 4 5; do
-              RESP=$(curl -s http://127.0.0.1:3001/health || true)
-              STATUS=$(echo "$RESP" | grep -o '"status":"ok"' || true)
-              if [ -n "$STATUS" ]; then
-                echo "Boot /health passed: $RESP"
-                break
-              fi
-              echo "Attempt $i: $RESP, retrying..."
-              sleep 5
-            done
-            if [ -z "$STATUS" ]; then
-              echo "Boot health check failed — last response: $RESP"
-              docker logs vibecraft-server-1 --tail 50 2>&1 || true
-              exit 1
-            fi
-
-            echo "=== Phase 2: stability observation (60s window) ==="
-            sleep 60
-            RESTARTS=$(docker inspect vibecraft-server-1 --format '{{.RestartCount}}')
-            echo "Server RestartCount after 60s: $RESTARTS"
-            if [ "$RESTARTS" -gt 0 ]; then
-              echo "FAIL: server crash-looped within stability window (RestartCount=$RESTARTS)"
-              docker logs vibecraft-server-1 --tail 80 2>&1 || true
-              exit 1
-            fi
-
-            FINAL_RESP=$(curl -s http://127.0.0.1:3001/health || true)
-            FINAL_STATUS=$(echo "$FINAL_RESP" | grep -o '"status":"ok"' || true)
-            if [ -z "$FINAL_STATUS" ]; then
-              echo "FAIL: /health degraded after stability window: $FINAL_RESP"
-              docker logs vibecraft-server-1 --tail 50 2>&1 || true
-              exit 1
-            fi
-            echo "Stability observation passed: $FINAL_RESP"
+            trap - EXIT
+            rm -f "/tmp/vibecraft-server-dist-${{ github.run_id }}.tgz"
